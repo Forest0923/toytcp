@@ -22,6 +22,7 @@ pub struct Socket {
     pub send_param: SendParam,
     pub recv_param: RecvParam,
     pub status: TcpStatus,
+    pub retransmission_queue: VecDeque<RetransmissionQueueEntry>,
     pub connected_connection_queue: VecDeque<SockID>,
     pub listening_socket: Option<SockID>,
     pub sender: TransportSender,
@@ -41,6 +42,13 @@ pub struct RecvParam {
     pub next: u32,
     pub tail: u32,
     pub window: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct RetransmissionQueueEntry {
+    pub packet: TCPPacket,
+    pub latest_transmission_time: SystemTime,
+    pub transmission_count: u8,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -104,6 +112,7 @@ impl Socket {
                 window: SOCKET_BUFFER_SIZE as u16,
             },
             status,
+            retransmission_queue: VecDeque::new(),
             connected_connection_queue: VecDeque::new(),
             listening_socket: None,
             sender,
@@ -139,8 +148,14 @@ impl Socket {
             .sender
             .send_to(tcp_packet.clone(), IpAddr::V4(self.remote_addr))
             .context(format!("failed to send: \n{:?}", tcp_packet))?;
-
         dbg!("sent", &tcp_packet);
+
+        if payload.is_empty() && tcp_packet.get_flag() == tcpflags::ACK {
+            return Ok(sent_size);
+        }
+        self.retransmission_queue
+            .push_back(RetransmissionQueueEntry::new(tcp_packet));
+
         Ok(sent_size)
     }
 
@@ -151,5 +166,15 @@ impl Socket {
             self.local_port,
             self.remote_port,
         )
+    }
+}
+
+impl RetransmissionQueueEntry {
+    fn new(packet: TCPPacket) -> Self {
+        Self {
+            packet,
+            latest_transmission_time: SystemTime::now(),
+            transmission_count: 1,
+        }
     }
 }
