@@ -14,8 +14,8 @@ use std::{cmp, ops::Range, str, thread};
 
 const UNDETERMINED_IP_ADDR: std::net::Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
 const UNDETERMINED_PORT: u16 = 0;
-const MAX_TRANSMITTION: u8 = 5;
-const RETRANSMITTION_TIMEOUT: u64 = 3;
+const MAX_TRANSMISSION: u8 = 5;
+const RETRANSMISSION_TIMEOUT: u64 = 3;
 const MSS: usize = 1460;
 const PORT_RANGE: Range<u16> = 40000..60000;
 
@@ -54,6 +54,10 @@ impl TCP {
         let cloned_tcp = tcp.clone();
         std::thread::spawn(move || {
             cloned_tcp.receive_handler().unwrap();
+        });
+        let cloned_tcp = tcp.clone();
+        std::thread::spawn(move || {
+            cloned_tcp.timer();
         });
         tcp
     }
@@ -149,6 +153,7 @@ impl TCP {
                 TcpStatus::Listen => self.listen_handler(table, sock_id, &packet, remote_addr),
                 TcpStatus::SynSent => self.synsent_handler(socket, &packet),
                 TcpStatus::SynRcvd => self.synrcvd_handler(table, sock_id, &packet),
+                TcpStatus::Established => self.established_handler(socket, &packet),
                 _ => {
                     dbg!("not implemented state");
                     Ok(())
@@ -283,6 +288,77 @@ impl TCP {
         cvar.notify_all();
     }
 
+    fn timer(&self) {
+        dbg!("begin timer thread");
+        loop {
+            let mut table = self.sockets.write().unwrap();
+            for (sock_id, socket) in table.iter_mut() {
+                while let Some(mut item) = socket.retransmission_queue.pop_front() {
+                    if socket.send_param.unacked_seq > item.packet.get_seq() {
+                        dbg!("successfully acked", item.packet.get_seq());
+                        socket.send_param.window += item.packet.payload().len() as u16;
+                        self.publish_event(*sock_id, TCPEventKind::Acked);
+                        continue;
+                    }
+                    if item.latest_transmission_time.elapsed().unwrap()
+                        < Duration::from_secs(RETRANSMISSION_TIMEOUT)
+                    {
+                        socket.retransmission_queue.push_front(item);
+                        break;
+                    }
+                    if item.transmission_count < MAX_TRANSMISSION {
+                        dbg!("retransmit");
+                        socket
+                            .sender
+                            .send_to(item.packet.clone(), IpAddr::V4(socket.remote_addr))
+                            .context("failed to retransmit")
+                            .unwrap();
+                        item.transmission_count += 1;
+                        item.latest_transmission_time = SystemTime::now();
+                        socket.retransmission_queue.push_back(item);
+                        break;
+                    } else {
+                        dbg!("reached MAX_TRANSMISSION");
+                    }
+                }
+            }
+            drop(table);
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn delete_acked_segment_from_retransmission_queue(&self, socket: &mut Socket) {
+        dbg!("ack accept", socket.send_param.unacked_seq);
+        // TODO: Research about deque
+        while let Some(item) = socket.retransmission_queue.pop_front() {
+            if socket.send_param.unacked_seq > item.packet.get_seq() {
+                dbg!("successfully acked", item.packet.get_seq());
+                socket.send_param.window += item.packet.payload().len() as u16;
+                self.publish_event(socket.get_sock_id(), TCPEventKind::Acked);
+            } else {
+                socket.retransmission_queue.push_front(item);
+                break;
+            }
+        }
+    }
+
+    fn established_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        dbg!("established handler");
+        if socket.send_param.unacked_seq < packet.get_ack()
+            && packet.get_ack() <= socket.send_param.next
+        {
+            socket.send_param.unacked_seq = packet.get_ack();
+            self.delete_acked_segment_from_retransmission_queue(socket);
+        } else if socket.send_param.next < packet.get_ack() {
+            return Ok(());
+        }
+
+        if packet.get_flag() & tcpflags::ACK == 0 {
+            return Ok(());
+        }
+        Ok(())
+    }
+
     pub fn listen(&self, local_addr: Ipv4Addr, local_port: u16) -> Result<SockID> {
         let socket = Socket::new(
             local_addr,
@@ -306,6 +382,48 @@ impl TCP {
             .connected_connection_queue
             .pop_front()
             .context("no connected socket")?)
+    }
+
+    pub fn send(&self, sock_id: SockID, buffer: &[u8]) -> Result<()> {
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            let mut table = self.sockets.write().unwrap();
+            let mut socket = table
+                .get_mut(&sock_id)
+                .context(format!("no such socket: {:?}", sock_id))?;
+            let mut send_size = cmp::min(
+                MSS,
+                cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
+            );
+
+            while send_size == 0 {
+                dbg!("unable to slide send window");
+                drop(table);
+                self.wait_event(sock_id, TCPEventKind::Acked);
+                table = self.sockets.write().unwrap();
+                socket = table
+                    .get_mut(&sock_id)
+                    .context(format!("no such socket: {:?}", sock_id))?;
+                send_size = cmp::min(
+                    MSS,
+                    cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
+                );
+            }
+            dbg!("current window size", socket.send_param.window);
+
+            socket.send_tcp_packet(
+                socket.send_param.next,
+                socket.recv_param.next,
+                tcpflags::ACK,
+                &buffer[cursor..cursor + send_size],
+            )?;
+            cursor += send_size;
+            socket.send_param.next += send_size as u32;
+            socket.send_param.window -= send_size as u16;
+            drop(table);
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
 }
 
