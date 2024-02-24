@@ -16,9 +16,7 @@ fn echo_client(remote_addr: Ipv4Addr, remote_port: u16) -> Result<()> {
     loop {
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        loop {
-            tcp.send(sock_id, input.repeat(2000).as_bytes())?;
-        }
+        tcp.send(sock_id, input.as_bytes())?;
     }
     Ok(())
 }
